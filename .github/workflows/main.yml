@@ -4,24 +4,22 @@ on:
   workflow_dispatch:
     inputs:
       android_version:
-        description: 'Android Version (Kernel) (e.g., 10)'
+        description: 'Android Version (Kernel) (e.g., 14)'
         required: true
-        default: '10'
       kernel_version:
-        description: 'Kernel Version (e.g., 4.14)'
+        description: 'Kernel Version (e.g., 6.1)'
         required: true
-        default: '4.14'
       driver_name:
         description: 'Driver Module Name (e.g., mydriver.ko)'
         required: true
       target_arch:
-        description: 'Target Architecture (aarch64, arm, x86_64, etc.)'
+        description: 'Target Architecture (aarch64, x86_64, etc.)'
         required: true
         default: 'aarch64'
 
 jobs:
   build:
-    runs-on: ubuntu-20.04  # 使用较旧的Ubuntu版本以兼容老工具链
+    runs-on: ubuntu-latest
     
     steps:
       - name: Checkout repository
@@ -29,13 +27,8 @@ jobs:
         
       - name: Prepare kerneldriver directory
         run: |
-          mkdir -p kerneldriver
-          # 复制所有驱动相关文件
-          find ./code -name "*.h" -exec cp {} kerneldriver/ \;
-          find ./code -name "*.c" -exec cp {} kerneldriver/ \;
-          if [ -f ./code/Makefile ]; then
-            cp ./code/Makefile kerneldriver/
-          fi
+          mkdir kerneldriver
+          mv ./code/*.h ./code/*.c ./code/Makefile kerneldriver/
           
       - name: Install repo tool
         run: |
@@ -45,98 +38,87 @@ jobs:
       - name: Set up Android Kernel source
         run: |
           mkdir -p android-kernel && cd android-kernel
-          # 使用Android 10对应的4.14稳定分支
+          # repo init -u https://android.googlesource.com/kernel/manifest -b common-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}
           repo init -u https://android.googlesource.com/kernel/manifest -b common-android-4.14-stable
           repo sync -j$(nproc) -c --no-tags --optimized-fetch --force-sync
 
       - name: Copy kerneldriver
         run: |
           cd android-kernel
-          cp -r ../kerneldriver common/drivers/
+          cp -r ../kerneldriver common/drivers
 
       - name: Modify Makefile
         run: |
           cd android-kernel
-          # 在drivers/Makefile中添加驱动目录
-          if ! grep -q "kerneldriver" common/drivers/Makefile; then
-            echo "obj-\$(CONFIG_KERNELDRIVER) += kerneldriver/" >> common/drivers/Makefile
-          fi
+          echo "obj-y += kerneldriver/" >> common/drivers/Makefile
 
-      - name: Create Kconfig for driver
-        run: |
-          cd android-kernel/common/drivers/kerneldriver
-          # 创建简单的Kconfig文件
-          cat > Kconfig << 'EOF'
-          config KERNELDRIVER
-          tristate "Custom Kernel Driver"
-          default m
-          help
-            This is a custom kernel driver.
-          EOF
-
-      - name: Add driver to Kconfig menu
+      - name: Add module to GKI modules list
+        if: ${{ github.event.inputs.android_version > 13 }}
         run: |
           cd android-kernel
-          # 在drivers/Kconfig末尾添加source
-          if ! grep -q "kerneldriver" common/drivers/Kconfig; then
-            echo "source \"drivers/kerneldriver/Kconfig\"" >> common/drivers/Kconfig
-          fi
-
-      - name: Prepare module list for Android 10
+          MODULE_NAME="drivers/kerneldriver/${{ github.event.inputs.driver_name }}"
+          
+          awk -i inplace -v module="$MODULE_NAME" '
+            BEGIN { added=0 }
+            /_COMMON_GKI_MODULES_LIST = \[/ { in_list=1 }
+            in_list && /\]/ {
+              if (!added) {
+                print "    \"" module "\","
+                added=1
+              }
+              in_list=0
+            }
+            in_list && !added {
+              if (module < $0) {
+                print "    \"" module "\","
+                added=1
+              }
+            }
+            { print }
+          ' common/modules.bzl
+          
+      - name: Prepare module list for legacy builds
+        if: ${{ github.event.inputs.android_version <= 13 }}
         run: |
           cd android-kernel
-          # 对于Android 10，使用传统的模块列表文件
-          MODULE_PATH="drivers/kerneldriver/${{ github.event.inputs.driver_name }}"
-          if [ "${{ github.event.inputs.target_arch }}" = "aarch64" ]; then
-            echo "$MODULE_PATH" >> common/android/gki_aarch64_modules
-          elif [ "${{ github.event.inputs.target_arch }}" = "arm" ]; then
-            echo "$MODULE_PATH" >> common/android/gki_arm_modules
-          elif [ "${{ github.event.inputs.target_arch }}" = "x86_64" ]; then
-            echo "$MODULE_PATH" >> common/android/gki_x86_64_modules
-          fi
-
+          echo "drivers/kerneldriver/${{ github.event.inputs.driver_name }}" >> common/android/gki_aarch64_modules
       - name: Increase stack frame size limit
         run: |
           cd android-kernel
-          # 增加栈帧大小限制以避免编译错误
-          find . -type f -name "Makefile*" -exec sed -i 's/-Wframe-larger-than=[0-9]*/-Wframe-larger-than=4096/g' {} + || true
-          if ! grep -q "FRAME_WARN" common/Makefile; then
-            echo 'KBUILD_CFLAGS += -Wframe-larger-than=4096' >> common/Makefile
-          fi
+          find . -type f -name "Makefile*" -exec sed -i 's/-Wframe-larger-than=[0-9]*/-Wframe-larger-than=4096/g' {} +
+          grep -q "FRAME_WARN" common/Makefile || echo 'KBUILD_CFLAGS += -Wframe-larger-than=4096' >> common/Makefile
 
-      - name: Install dependencies for Android 10
+      - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev bc python2.7
-          # 创建python2符号链接
-          sudo ln -sf /usr/bin/python2.7 /usr/bin/python2
-          sudo ln -sf /usr/bin/python2.7 /usr/bin/python
-
-      - name: Set up build environment
+          sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev bc python-is-python3
+      - name: Fix missing kprobe symbols for Android 13
+        if: ${{ github.event.inputs.android_version == 13 }}
         run: |
           cd android-kernel
-          # 设置构建环境变量
-          export ARCH=${{ github.event.inputs.target_arch }}
-          if [ "$ARCH" = "aarch64" ]; then
-            export CROSS_COMPILE=aarch64-linux-android-
-          elif [ "$ARCH" = "arm" ]; then
-            export CROSS_COMPILE=arm-linux-androideabi-
-          fi
-
-      - name: Build kernel module for Android 10
-        run: |
-          cd android-kernel
-          # 对于Android 10使用传统构建系统
-          BUILD_CONFIG=common/build.config.gki.${{ github.event.inputs.target_arch }} build/build.sh
+          for symbol in register_kprobe unregister_kprobe; do
+            grep -q "$symbol" common/android/abi_gki_${{ github.event.inputs.target_arch }} || \
+            echo "$symbol" >> common/android/abi_gki_${{ github.event.inputs.target_arch }}
+          done
+          sed -i '/EXPORT_SYMBOL(unregister_kprobe);/a EXPORT_SYMBOL(register_kprobe);' common/kernel/kprobes.c
           
-          # 查找生成的模块文件
-          find . -name "${{ github.event.inputs.driver_name }}" -type f | head -1
-          echo "OUTPUT_PATH=out/android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}" >> $GITHUB_ENV
-
+      - name: Build kernel module
+        run: |
+          cd android-kernel
+          if [ ${{ github.event.inputs.android_version }} -le 13 ]; then
+            BUILD_CONFIG=common/build.config.gki.${{ github.event.inputs.target_arch }} LTO=thin build/build.sh -j32
+            OUTPUT_PATH="out/android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}/dist"
+          else
+            echo "Using Bazel build system for Android ${{ github.event.inputs.android_version }}"
+            tools/bazel run //common:kernel_${{ github.event.inputs.target_arch }}_dist
+            OUTPUT_PATH="out/kernel_${{ github.event.inputs.target_arch }}"
+          fi
+          echo "OUTPUT_PATH=$OUTPUT_PATH" >> $GITHUB_ENV
+        continue-on-error: true
+      
       - name: Upload artifacts
         uses: actions/upload-artifact@v4.6.2
         with:
-          name: kernel-driver-${{ github.event.inputs.target_arch }}-android10
+          name: kernel-driver-${{ github.event.inputs.target_arch }}
           path: |
             android-kernel/${{ env.OUTPUT_PATH }}
-          retention-days: 7
